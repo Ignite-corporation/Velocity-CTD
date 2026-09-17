@@ -55,6 +55,7 @@ import com.velocitypowered.proxy.protocol.packet.config.ClientboundCustomReportD
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundServerLinksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
+import com.velocitypowered.proxy.protocol.packet.config.KnownPacksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.RegistrySyncPacket;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
@@ -64,6 +65,7 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import java.net.InetSocketAddress;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -143,7 +145,27 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(TagsUpdatePacket packet) {
+    if (clientStayedInPlay()) {
+      return true;
+    }
+
     serverConn.getPlayer().getConnection().write(packet);
+    return true;
+  }
+
+  @Override
+  public boolean handle(KnownPacksPacket packet) {
+    if (!clientStayedInPlay()) {
+      return false; // forward to the client, which will answer it itself
+    }
+
+    // The backend blocks until this is answered, and the client cannot answer while it is in play.
+    // Reply on its behalf with the vanilla core pack, which is all a client reports by default.
+    final List<KnownPacksPacket.KnownPack> clientPacks = List.of(new KnownPacksPacket.KnownPack(
+        "minecraft", "core",
+        serverConn.getPlayer().getProtocolVersion().getVersionIntroducedIn()));
+    serverConn.ensureConnected().write(new KnownPacksPacket(
+        packet.getPacks().stream().distinct().filter(clientPacks::contains).toList()));
     return true;
   }
 
@@ -252,7 +274,32 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   public boolean handle(FinishedUpdatePacket packet) {
     final MinecraftConnection smc = serverConn.ensureConnected();
     final ConnectedPlayer player = serverConn.getPlayer();
-    final ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
+    final ClientConfigSessionHandler configHandler =
+        player.getConnection().getActiveSessionHandler() instanceof ClientConfigSessionHandler handler
+            ? handler : null;
+
+    if (configHandler == null) {
+      // The client never left play, so there is no client-side configuration to finish and no
+      // acknowledgement to wait for. The client also cannot resend its brand, so replay the one we
+      // recorded when it first joined, then advance the backend on its own.
+      final String clientBrand = player.getClientBrand();
+      if (clientBrand != null) {
+        final ByteBuf brandBuf = Unpooled.buffer();
+        ProtocolUtils.writeString(brandBuf, clientBrand);
+        smc.write(new PluginMessagePacket("minecraft:brand", brandBuf));
+      }
+
+      // A tick later, so the brand message is written before the state flips under it.
+      smc.eventLoop().execute(() -> {
+        advanceBackendToPlay(false);
+        smc.removePlayPacketQueueInboundHandler();
+
+        if (player.resourcePackHandler().getFirstAppliedPack() == null && resourcePackToApply != null) {
+          player.resourcePackHandler().queueResourcePack(resourcePackToApply);
+        }
+      });
+      return true;
+    }
 
     // Start client-side configuration; may hold the player to apply a resource pack.
     // The backend stays in CONFIG until it reads our acknowledgement (see advanceBackendToPlay).
@@ -344,6 +391,10 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(RegistrySyncPacket packet) {
+    if (clientStayedInPlay()) {
+      return true;
+    }
+
     serverConn.getPlayer().getConnection().write(packet.retain());
     return true;
   }
@@ -413,6 +464,18 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   }
 
   /**
+   * Returns whether the client was left in the play state for this switch, which is what
+   * {@code remove-reconfig} does. When it was, anything that only makes sense to a client in the
+   * configuration state has to be answered here instead of relayed.
+   *
+   * @return {@code true} if the client never entered the configuration state
+   */
+  private boolean clientStayedInPlay() {
+    return !(serverConn.getPlayer().getConnection().getActiveSessionHandler()
+        instanceof ClientConfigSessionHandler);
+  }
+
+  /**
    * Acknowledges the backend and advances it to PLAY, decoupled from the client. Runs at most once.
    *
    * @param buffer whether to buffer the backend's inbound PLAY packets until the client enters PLAY
@@ -476,6 +539,12 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    if (clientStayedInPlay()) {
+      // A configuration packet the proxy cannot decode would be read by a client in play as
+      // whatever play packet shares its ID.
+      return;
+    }
+
     serverConn.getPlayer().getConnection().write(buf.retain());
   }
 

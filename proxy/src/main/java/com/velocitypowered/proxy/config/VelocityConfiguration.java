@@ -163,6 +163,8 @@ public final class VelocityConfiguration implements ProxyConfig {
 
   @Expose
   private final boolean enablePlayerAddressLogging;
+  private final boolean removeReconfig;
+  private final boolean keepClientWorldOnSwitch;
 
   @Expose
   private final boolean forceKeyAuthentication;
@@ -261,6 +263,7 @@ public final class VelocityConfiguration implements ProxyConfig {
                                 boolean kickExistingPlayers, boolean kickExistingPlayersCheckIp,
                                 PingPassthroughMode pingPassthrough,
                                 boolean enablePlayerAddressLogging,
+                                boolean removeReconfig, boolean keepClientWorldOnSwitch,
                                 Servers servers, ForcedHosts forcedHosts,
                                 Map<String, List<String>> commandAliases,
                                 Map<String, List<String>> proxyCommandAliases,
@@ -290,6 +293,8 @@ public final class VelocityConfiguration implements ProxyConfig {
     this.kickExistingPlayersCheckIp = kickExistingPlayersCheckIp;
     this.pingPassthrough = pingPassthrough;
     this.enablePlayerAddressLogging = enablePlayerAddressLogging;
+    this.removeReconfig = removeReconfig;
+    this.keepClientWorldOnSwitch = keepClientWorldOnSwitch;
     this.servers = servers;
     this.forcedHosts = forcedHosts;
     this.commandAliases = commandAliases;
@@ -829,6 +834,26 @@ public final class VelocityConfiguration implements ProxyConfig {
     return enablePlayerAddressLogging;
   }
 
+  /**
+   * Returns whether players stay in the play state across a backend switch instead of being sent
+   * back through the configuration state.
+   *
+   * @return {@code true} if the configuration state is skipped on switches
+   */
+  public boolean isRemoveReconfig() {
+    return removeReconfig;
+  }
+
+  /**
+   * Returns whether the client keeps the world it already has across a backend switch, when the
+   * destination cooperates by reusing the client's entity ID and dimension.
+   *
+   * @return {@code true} if the client's world may be preserved across switches
+   */
+  public boolean isKeepClientWorldOnSwitch() {
+    return keepClientWorldOnSwitch;
+  }
+
   public boolean isBungeePluginChannelEnabled() {
     return advanced.isBungeePluginMessageChannel();
   }
@@ -1071,6 +1096,8 @@ public final class VelocityConfiguration implements ProxyConfig {
         .add("redis", redis)
         .add("queue", queue)
         .add("enablePlayerAddressLogging", enablePlayerAddressLogging)
+        .add("removeReconfig", removeReconfig)
+        .add("keepClientWorldOnSwitch", keepClientWorldOnSwitch)
         .add("forceKeyAuthentication", forceKeyAuthentication)
         .add("packetLimiterConfig", packetLimiterConfig)
         .add("logPlayerConnections", logPlayerConnections)
@@ -1217,6 +1244,8 @@ public final class VelocityConfiguration implements ProxyConfig {
       boolean kickExisting = config.getOrElse("kick-existing-players", false);
       boolean kickExistingCheckIp = config.getOrElse("kick-existing-players-check-ip", false);
       boolean enablePlayerAddressLogging = config.getOrElse("enable-player-address-logging", true);
+      boolean removeReconfig = config.getOrElse("remove-reconfig", false);
+      boolean keepClientWorldOnSwitch = config.getOrElse("keep-client-world-on-switch", false);
       PacketLimiterConfig packetLimiterConfig = PacketLimiterConfig.fromConfig(config.get("packet-limiter"));
       AntiVpnConfig antiVpnConfig = AntiVpnConfig.fromConfig(config.get("anti-vpn"));
       boolean logPlayerConnections = config.getOrElse("log-player-connections", true);
@@ -1306,6 +1335,8 @@ public final class VelocityConfiguration implements ProxyConfig {
           kickExistingCheckIp,
           pingPassthrough,
           enablePlayerAddressLogging,
+          removeReconfig,
+          keepClientWorldOnSwitch,
           new Servers(serversConfig),
           new ForcedHosts(forcedHostsConfig),
           parseCommandAliases(commandAliasesConfig),
