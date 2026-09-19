@@ -279,6 +279,10 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private boolean firstServerConnected = false;
 
   private @Nullable String clientBrand;
+
+  /** Hash of the registries and tags the client last received, in a real configuration phase. */
+  private volatile @Nullable String clientRegistryFingerprint;
+
   private @Nullable Locale effectiveLocale;
   private final @Nullable IdentifiedKey playerKey;
   private @Nullable ClientSettingsPacket clientSettingsPacket;
@@ -1603,6 +1607,14 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
 
   void setClientBrand(final @Nullable String clientBrand) {
     this.clientBrand = clientBrand;
+  }
+
+  public @Nullable String getClientRegistryFingerprint() {
+    return clientRegistryFingerprint;
+  }
+
+  public void setClientRegistryFingerprint(@Nullable String clientRegistryFingerprint) {
+    this.clientRegistryFingerprint = clientRegistryFingerprint;
   }
 
   @Override
