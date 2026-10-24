@@ -17,6 +17,7 @@
 
 package com.velocitypowered.proxy;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.gson.Gson;
@@ -782,7 +783,8 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     return aliases.toArray(String[]::new);
   }
 
-  private void reconcileServers(VelocityConfiguration oldConfiguration,
+  @VisibleForTesting
+  void reconcileServers(VelocityConfiguration oldConfiguration,
       VelocityConfiguration newConfiguration) {
     List<ServerInfo> desired = new ArrayList<>();
     for (Map.Entry<String, BackendServerConfig> entry : newConfiguration.getBackendServers().entrySet()) {
