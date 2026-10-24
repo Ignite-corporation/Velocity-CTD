@@ -22,6 +22,7 @@ import com.velocitypowered.api.event.player.ServerLoginPluginMessageEvent;
 import com.velocitypowered.api.event.player.configuration.PlayerEnteredConfigurationEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
+import com.velocitypowered.api.proxy.player.ClientWorldSwitches;
 import com.velocitypowered.api.proxy.server.PlayerInfoForwarding;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
@@ -34,6 +35,7 @@ import com.velocitypowered.proxy.connection.util.ConnectionRequestResults;
 import com.velocitypowered.proxy.connection.util.ConnectionRequestResults.Impl;
 import com.velocitypowered.proxy.network.Connections;
 import com.velocitypowered.proxy.network.netty.VelocityReadTimeoutHandler;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.packet.ClientboundCookieRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.ClientboundStoreCookiePacket;
@@ -44,6 +46,7 @@ import com.velocitypowered.proxy.protocol.packet.LoginPluginMessagePacket;
 import com.velocitypowered.proxy.protocol.packet.LoginPluginResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.ServerLoginSuccessPacket;
 import com.velocitypowered.proxy.protocol.packet.SetCompressionPacket;
+import com.velocitypowered.proxy.server.VelocityRegisteredServer;
 import com.velocitypowered.proxy.util.except.QuietRuntimeException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -53,15 +56,25 @@ import java.util.concurrent.TimeUnit;
 import net.kyori.adventure.key.Key;
 import net.kyori.adventure.text.Component;
 import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 /**
  * Handles a player trying to log into the proxy.
  */
 public class LoginSessionHandler implements MinecraftSessionHandler {
 
-  static {
-    LogManager.getLogger(LoginSessionHandler.class);
-  }
+  private static final Logger LOGGER = LogManager.getLogger(LoginSessionHandler.class);
+
+  /**
+   * Login-phase channel the backend companion plugin uses to ask for the client's entity ID, so a
+   * world-preserving switch can reuse it. See {@code keep-client-world-on-switch}.
+   */
+  private static final String SEAMLESS_CHANNEL = "velocityctd:seamless";
+
+  /**
+   * Payload format version, so the plugin can refuse a proxy it does not understand.
+   */
+  private static final byte SEAMLESS_FORMAT_VERSION = 1;
 
   private static final Component MODERN_IP_FORWARDING_FAILURE =
       Component.translatable("velocity.error.modern-forwarding-failed");
@@ -111,6 +124,8 @@ public class LoginSessionHandler implements MinecraftSessionHandler {
               packet.getId(), true, forwardingData);
       mc.write(response);
       informationForwarded = true;
+    } else if (packet.getChannel().equals(SEAMLESS_CHANNEL)) {
+      mc.write(new LoginPluginResponsePacket(packet.getId(), true, seamlessHandshake()));
     } else {
       // Don't understand, fire event if we have subscribers
       if (!this.server.getEventManager().hasSubscribers(ServerLoginPluginMessageEvent.class)) {
@@ -182,8 +197,16 @@ public class LoginSessionHandler implements MinecraftSessionHandler {
         smc.write(player.getClientSettingsPacket());
       }
       if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler clientPlaySessionHandler) {
-        smc.setAutoReading(false);
-        clientPlaySessionHandler.doSwitch().thenRunAsync(() -> smc.setAutoReading(true), smc.eventLoop());
+        // With "remove-reconfig" the client is left in play for the whole switch: this is the one
+        // place that would otherwise push it back into configuration, and the "Reconfiguring..."
+        // screen it shows. The backend still runs its own configuration phase; ConfigSessionHandler
+        // answers it on the client's behalf. Only when the client already holds the registries and
+        // tags this server sends, though, since it would decode this server with the ones it has.
+        if (!server.getConfiguration().isRemoveReconfig()
+            || !clientHoldsRegistriesOf(player, serverConn.getServer())) {
+          smc.setAutoReading(false);
+          clientPlaySessionHandler.doSwitch().thenRunAsync(() -> smc.setAutoReading(true), smc.eventLoop());
+        }
       } else {
         // Initial login - the player is already in configuration state.
         server.getEventManager().fireAndForget(new PlayerEnteredConfigurationEvent(player, serverConn));
@@ -234,5 +257,60 @@ public class LoginSessionHandler implements MinecraftSessionHandler {
           new QuietRuntimeException("The connection to the remote server was unexpectedly closed.")
       );
     }
+  }
+
+  /**
+   * Returns whether the client already holds exactly the registries and tags {@code target} sent
+   * the last time the proxy saw it configure. A server not seen yet since the proxy started does
+   * not count; switching there through the configuration state is what records it.
+   *
+   * @param player the switching player
+   * @param target the destination
+   * @return {@code true} if the client can stay in play for this switch
+   */
+  static boolean clientHoldsRegistriesOf(ConnectedPlayer player, VelocityRegisteredServer target) {
+    final String held = player.getClientRegistryFingerprint();
+    return held != null && held.equals(target.getRegistryFingerprint());
+  }
+
+  /**
+   * Tells the backend companion plugin which entity ID this player's client already holds, so
+   * the backend can reuse it instead of issuing a fresh one.
+   *
+   * <p>The backend cannot work this out for itself -- the ID was assigned by whichever server the
+   * player joined first -- and it has to know before it builds the join game packet, which is why
+   * this rides the login phase rather than an ordinary plugin message.</p>
+   *
+   * <p>The ID is the player's for the whole session, allocated out of a range no backend issues
+   * from, and is asked for on the first join too. A backend that gave out one of its own would
+   * sooner or later hand a player an ID it had already given to a hologram or a dropped item, and
+   * a server refuses to add an entity whose ID is taken -- the player would not enter the world.</p>
+   *
+   * <p>A zero entity ID means "join the player normally": the feature is off. The backend treats
+   * that as no instruction, and the proxy's own check then falls back to a normal switch.</p>
+   *
+   * @return the response payload: a format byte followed by the entity ID
+   */
+  private ByteBuf seamlessHandshake() {
+    final ConnectedPlayer player = serverConn.getPlayer();
+    // Only servers that share a map with another have any use for it: those are the only switches
+    // that keep the client's world. Everywhere else the backend issues its own ID as it always did,
+    // which keeps this out of the way of servers that gain nothing from it.
+    final int entityId = server.getConfiguration().isKeepClientWorldOnSwitch()
+        && server.getConfiguration().getSharedMapGroups()
+            .isGrouped(serverConn.getServerInfo().getName())
+        ? ClientWorldSwitches.networkEntityId(player.getUniqueId())
+        : 0;
+
+    if (entityId > 0) {
+      // One line per switch is noise once this works; it is here for when it stops working.
+      LOGGER.debug("Asking {} to join {} as entity {}", serverConn.getServerInfo().getName(),
+          player.getUsername(), entityId);
+    }
+
+    final ByteBuf response = Unpooled.buffer(5);
+    response.writeByte(SEAMLESS_FORMAT_VERSION);
+    ProtocolUtils.writeVarInt(response, entityId);
+    return response;
   }
 }

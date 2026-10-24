@@ -32,6 +32,7 @@ import com.velocitypowered.api.event.player.TabCompleteEvent;
 import com.velocitypowered.api.event.player.configuration.PlayerEnteredConfigurationEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
+import com.velocitypowered.api.proxy.player.ClientWorldSwitches;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.connection.ConnectionTypes;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
@@ -40,7 +41,9 @@ import com.velocitypowered.proxy.connection.backend.BackendConnectionPhases;
 import com.velocitypowered.proxy.connection.backend.BungeeCordMessageResponder;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResponseBundle;
+import com.velocitypowered.proxy.connection.registry.DimensionInfo;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.packet.BossBarPacket;
@@ -84,6 +87,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -118,7 +122,25 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   private final ConnectedPlayer player;
   private boolean spawned = false;
+
+  /**
+   * The entity ID and dimension the client currently believes it is in. A world-preserving switch
+   * is only safe when the destination reproduces both, so both are tracked from whatever last told
+   * the client about them -- a join game on a switch, or a respawn from a local world change.
+   */
+  private int clientEntityId = -1;
+
+  private @Nullable String clientDimension;
+
+  /** The server whose world the client is holding, to tell a switch within a map from one across. */
+  private @Nullable String clientWorldServer;
+
   private final List<UUID> serverBossBars = new ArrayList<>();
+
+  private final ServerScoreboardTracker serverScoreboard = new ServerScoreboardTracker();
+
+  private final ServerEntityTracker serverEntities = new ServerEntityTracker();
+
   private final Queue<PluginMessagePacket> loginPluginMessages = new ConcurrentLinkedQueue<>();
   private final AtomicLong loginPluginMessagesBytes = new AtomicLong();
   private final AtomicInteger loginPluginMessagesCount = new AtomicInteger();
@@ -648,6 +670,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       spawned = false;
       player.clearPlayerListHeaderAndFooterSilent();
       player.getTabList().clearAllSilent();
+      serverScoreboard.clear();
+      serverEntities.clear();
       if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
         player.getBossBarManager().dropPackets();
       } else {
@@ -670,6 +694,17 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   public void handleBackendJoinGame(JoinGamePacket joinGame, VelocityServerConnection destination) {
     final MinecraftConnection serverMc = destination.ensureConnected();
 
+    if (spawned && server.getConfiguration().isRemoveReconfig()) {
+      // Nothing else wipes the client's scoreboard or tab header when it stays in play, so the
+      // previous server's sidebar, teams and header would outlive the switch. Remove them before
+      // anything from the destination is relayed, and before a join game on the fallback path.
+      for (ByteBuf removal : serverScoreboard.drainRemovals(
+          player.getConnection().getChannel().alloc(), player.getProtocolVersion())) {
+        player.getConnection().delayedWrite(removal);
+      }
+      player.clearPlayerListHeaderAndFooter();
+    }
+
     if (!spawned) {
       // The player wasn't spawned in yet, so we don't need to do anything special. Just send
       // JoinGame.
@@ -677,9 +712,33 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       player.getConnection().delayedWrite(joinGame);
       // Required for Legacy Forge
       player.getPhase().onFirstJoin(player);
+      rememberClientWorld(joinGame, destination);
+    } else if (canKeepClientWorld(joinGame, destination)) {
+      // The destination has put the player back in the dimension the client already has, under the
+      // entity ID it already has. Withholding the join game and respawn packets is precisely what
+      // stops the client from tearing down and rebuilding its level -- no terrain loading screen.
+      player.getTabList().clearAll();
+
+      // A kept world keeps everything in it, and the destination cannot remove entities it never
+      // spawned, so the previous server's holograms and NPCs would hang here frozen.
+      final ByteBuf entityRemoval = serverEntities.drainRemovals(
+          player.getConnection().getChannel().alloc(), player.getProtocolVersion());
+      if (entityRemoval != null) {
+        player.getConnection().delayedWrite(entityRemoval);
+      }
+
+      // Because it never receives a join game, the client never reports that it finished loading
+      // the world. The backend waits for that before it accepts movement, so the player would
+      // stand still server-side while their client walks away. It is loaded by definition here,
+      // so say so on its behalf.
+      serverMc.write(ServerboundPlayerLoadedPacket.INSTANCE);
+      destination.setClientLoaded(true);
     } else {
       // Clear tab list to avoid duplicate entries
       player.getTabList().clearAll();
+
+      // The join game below rebuilds the client's level, which takes its entities with it.
+      serverEntities.clear();
 
       // The player is switching from a server already, so we need to tell the client to change
       // entity IDs and send new dimension information.
@@ -688,10 +747,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       } else {
         this.doFastClientServerSwitch(joinGame);
       }
+
+      rememberClientWorld(joinGame, destination);
     }
 
     destination.setEntityId(joinGame.getEntityId()); // used for sound api
-    if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
+    if (!server.getConfiguration().isRemoveReconfig()
+        && player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
       player.getBossBarManager().sendBossBars();
     } else {
       // Remove previous boss bars. These don't get cleared when sending JoinGame (up until 1.20.2),
@@ -725,8 +787,10 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     loginPluginMessagesBytes.set(0);
     loginPluginMessagesCount.set(0);
 
-    // Clear any title from the previous server.
-    if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_8)) {
+    // Clear any title from the previous server. Skipped when the client was left in play, so the
+    // fade of an in-progress teleport survives the switch.
+    if (!server.getConfiguration().isRemoveReconfig()
+        && player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_8)) {
       player.getConnection().delayedWrite(
           GenericTitlePacket.constructTitlePacket(GenericTitlePacket.ActionType.RESET,
               player.getProtocolVersion()));
@@ -736,6 +800,82 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     player.getConnection().flush();
     serverMc.flush();
     destination.completeJoin();
+  }
+
+  private void rememberClientWorld(JoinGamePacket joinGame, VelocityServerConnection destination) {
+    clientWorldServer = destination.getServerInfo().getName();
+    clientEntityId = joinGame.getEntityId();
+    clientDimension = dimensionKey(joinGame.getDimensionInfo(), joinGame.getDimension());
+    ClientWorldSwitches.rememberClientEntityId(player.getUniqueId(), clientEntityId);
+  }
+
+  /**
+   * Records a dimension change a backend made without a server switch, such as a nether portal.
+   * Without this the proxy keeps whatever dimension it last saw in a join game, which goes stale
+   * the moment the player changes world locally, and then refuses to preserve the client world on
+   * the next switch.
+   *
+   * @param respawn the respawn packet the backend sent the client
+   */
+  public void rememberClientDimension(RespawnPacket respawn) {
+    clientDimension = dimensionKey(respawn.getDimensionInfo(), respawn.getDimension());
+  }
+
+  private static @Nullable String dimensionKey(@Nullable DimensionInfo info, int legacyDimension) {
+    if (info == null) {
+      return Integer.toString(legacyDimension);
+    }
+    return info.getRegistryIdentifier() + "\u0000" + info.getLevelName();
+  }
+
+  /**
+   * Decides whether the client can keep the world it already has for this switch.
+   *
+   * <p>Both halves have to hold: the destination has to have joined the player into the dimension
+   * the client was last told about, and it has to have given them the entity ID the client already
+   * holds -- which a backend arranges for itself, from the ID this proxy publishes through
+   * {@link ClientWorldSwitches}. When either does not hold we fall back to an ordinary switch, so
+   * turning this on cannot break a session, only fail to help.</p>
+   */
+  private boolean canKeepClientWorld(JoinGamePacket joinGame, VelocityServerConnection destination) {
+    if (!server.getConfiguration().isKeepClientWorldOnSwitch()) {
+      return false;
+    }
+
+    // Across maps the client would watch the old one dissolve into the new, which is worse than
+    // the screen it saves. Only the operator knows which servers are copies of one another.
+    if (!server.getConfiguration().getSharedMapGroups()
+        .sameMap(clientWorldServer, destination.getServerInfo().getName())) {
+      return false;
+    }
+
+    // Legacy Forge needs its own respawn dance, and before 1.16 a same-dimension switch needed an
+    // extra respawn anyway, so neither can skip the packets.
+    if (player.getConnection().getType() == ConnectionTypes.LEGACY_FORGE
+        || player.getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_16)) {
+      return false;
+    }
+
+    if (joinGame.getEntityId() != clientEntityId) {
+      // Worth a line: this is a backend that did not apply the ID the proxy handed it, and the
+      // player pays a loading screen for it on every switch.
+      LOGGER.info("{} rebuilds its world for {}: it joined them as entity {}, their client has {}",
+          player.getConnectedServer() == null ? "the destination"
+              : player.getConnectedServer().getServerInfo().getName(),
+          player.getUsername(), joinGame.getEntityId(), clientEntityId);
+      return false;
+    }
+
+    final String joinedInto = dimensionKey(joinGame.getDimensionInfo(), joinGame.getDimension());
+    if (!Objects.equals(joinedInto, clientDimension)) {
+      LOGGER.info("{} rebuilds its world for {}: it joined them into {}, their client is in {}",
+          player.getConnectedServer() == null ? "the destination"
+              : player.getConnectedServer().getServerInfo().getName(),
+          player.getUsername(), joinedInto, clientDimension);
+      return false;
+    }
+
+    return true;
   }
 
   private void doFastClientServerSwitch(JoinGamePacket joinGame) {
@@ -779,6 +919,28 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   public List<UUID> getServerBossBars() {
     return serverBossBars;
+  }
+
+  /**
+   * Notes what the backend puts on the client that a switch would otherwise leave behind: scoreboard
+   * objectives and teams, and spawned entities. See {@link ServerScoreboardTracker} and
+   * {@link ServerEntityTracker}.
+   *
+   * @param packet a clientbound play packet the proxy forwards undecoded; left untouched
+   */
+  public void observeServerPacket(ByteBuf packet) {
+    final int start = packet.readerIndex();
+    try {
+      final int packetId = ProtocolUtils.readVarInt(packet);
+      final int afterId = packet.readerIndex();
+      serverScoreboard.observe(packetId, packet, player.getProtocolVersion());
+      packet.readerIndex(afterId);
+      serverEntities.observe(packetId, packet, player.getProtocolVersion());
+    } catch (RuntimeException malformed) {
+      // Not ours to judge: the packet is forwarded as it is, it just goes untracked.
+    } finally {
+      packet.readerIndex(start);
+    }
   }
 
   private boolean handleCommandTabComplete(TabCompleteRequestPacket packet) {

@@ -62,6 +62,7 @@ import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
 import com.velocitypowered.api.proxy.crypto.KeyIdentifiable;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.PluginMessageEncoder;
+import com.velocitypowered.api.proxy.player.ClientWorldSwitches;
 import com.velocitypowered.api.proxy.player.PlayerSettings;
 import com.velocitypowered.api.proxy.player.ResourcePackInfo;
 import com.velocitypowered.api.proxy.server.PlayerInfoForwarding;
@@ -278,6 +279,13 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private boolean firstServerConnected = false;
 
   private @Nullable String clientBrand;
+
+  /** Hash of the registries and tags the client last received, in a real configuration phase. */
+  private volatile @Nullable String clientRegistryFingerprint;
+
+  /** The same, split per registry, to name what differs when a switch has to reconfigure. */
+  private volatile Map<String, String> clientRegistryHashes = Map.of();
+
   private @Nullable Locale effectiveLocale;
   private final @Nullable IdentifiedKey playerKey;
   private @Nullable ClientSettingsPacket clientSettingsPacket;
@@ -1466,6 +1474,8 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   }
 
   void teardown() {
+    ClientWorldSwitches.forget(getUniqueId());
+
     if (connectionInFlight != null) {
       connectionInFlight.disconnect();
     }
@@ -1600,6 +1610,22 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
 
   void setClientBrand(final @Nullable String clientBrand) {
     this.clientBrand = clientBrand;
+  }
+
+  public @Nullable String getClientRegistryFingerprint() {
+    return clientRegistryFingerprint;
+  }
+
+  public void setClientRegistryFingerprint(@Nullable String clientRegistryFingerprint) {
+    this.clientRegistryFingerprint = clientRegistryFingerprint;
+  }
+
+  public Map<String, String> getClientRegistryHashes() {
+    return clientRegistryHashes;
+  }
+
+  public void setClientRegistryHashes(Map<String, String> clientRegistryHashes) {
+    this.clientRegistryHashes = clientRegistryHashes;
   }
 
   @Override

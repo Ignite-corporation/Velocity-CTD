@@ -59,6 +59,7 @@ import com.velocitypowered.proxy.protocol.packet.RemovePlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.RemoveResourcePackPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
+import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerDataPacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TransferPacket;
@@ -190,8 +191,20 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
   }
 
   @Override
+  public boolean handle(RespawnPacket packet) {
+    // A backend can move the player between dimensions without a server switch (a nether portal,
+    // a /world command). Record it, or the dimension we hold goes stale and the next switch
+    // needlessly refuses to preserve the client's world.
+    playerSessionHandler.rememberClientDimension(packet);
+    return false; // Forward
+  }
+
+  @Override
   public boolean handle(BossBarPacket packet) {
-    if (serverConn.getPlayer().getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
+    // Without the configuration state the client keeps its boss bars across a switch, so on every
+    // version they have to be tracked and removed by hand, not just below 1.20.2.
+    if (server.getConfiguration().isRemoveReconfig()
+        || serverConn.getPlayer().getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
       if (packet.getAction() == BossBarPacket.ADD) {
         playerSessionHandler.getServerBossBars().add(packet.getUuid());
       } else if (packet.getAction() == BossBarPacket.REMOVE) {
@@ -477,6 +490,12 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    // Same reason as the boss bars above: without the configuration state, and even more so when
+    // the client also keeps its world, what this server puts on the client outlives the switch, so
+    // it has to be tracked to be taken away again.
+    if (server.getConfiguration().isRemoveReconfig()) {
+      playerSessionHandler.observeServerPacket(buf);
+    }
     boolean huge = buf.readableBytes() > LARGE_PACKET_THRESHOLD;
     playerConnection.delayedWrite(buf.retain());
     if (huge || ++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {

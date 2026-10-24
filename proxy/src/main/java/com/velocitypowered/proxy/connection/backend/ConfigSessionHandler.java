@@ -25,6 +25,7 @@ import com.velocitypowered.api.event.player.PlayerResourcePackStatusEvent;
 import com.velocitypowered.api.event.player.ServerResourcePackRemoveEvent;
 import com.velocitypowered.api.event.player.ServerResourcePackSendEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.player.ResourcePackInfo;
 import com.velocitypowered.proxy.VelocityServer;
@@ -55,15 +56,19 @@ import com.velocitypowered.proxy.protocol.packet.config.ClientboundCustomReportD
 import com.velocitypowered.proxy.protocol.packet.config.ClientboundServerLinksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.CodeOfConductPacket;
 import com.velocitypowered.proxy.protocol.packet.config.FinishedUpdatePacket;
+import com.velocitypowered.proxy.protocol.packet.config.KnownPacksPacket;
 import com.velocitypowered.proxy.protocol.packet.config.RegistrySyncPacket;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
 import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
 import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
+import com.velocitypowered.proxy.server.VelocityRegisteredServer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import java.net.InetSocketAddress;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -99,6 +104,12 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   // since this handler serves every configuration phase of the connection, including one the
   // backend starts again from PLAY.
   private boolean backendAdvancedToPlay;
+
+  private final RegistryFingerprint registryFingerprint = new RegistryFingerprint();
+
+  // Whether this server's tags reached a client that stayed in play, and so whether it now holds
+  // everything this server sent rather than the previous server's tags.
+  private boolean tagsSentInPlay;
 
   /**
    * Creates the new transition handler.
@@ -143,7 +154,38 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(TagsUpdatePacket packet) {
-    serverConn.getPlayer().getConnection().write(packet);
+    final ConnectedPlayer player = serverConn.getPlayer();
+    registryFingerprint.add(packet, player.getProtocolVersion());
+    if (clientStayedInPlay()) {
+      // The client never entered the configuration state these arrive in, but the play state has
+      // the same packet -- it is what a datapack reload sends -- so hand them over there instead
+      // of dropping them and leaving the client on the previous server's tags.
+      final ByteBuf inPlay = TagsInPlay.encode(packet, player.getProtocolVersion(),
+          player.getConnection().getChannel().alloc());
+      if (inPlay != null) {
+        player.getConnection().write(inPlay);
+        tagsSentInPlay = true;
+      }
+      return true;
+    }
+
+    player.getConnection().write(packet);
+    return true;
+  }
+
+  @Override
+  public boolean handle(KnownPacksPacket packet) {
+    if (!clientStayedInPlay()) {
+      return false; // forward to the client, which will answer it itself
+    }
+
+    // The backend blocks until this is answered, and the client cannot answer while it is in play.
+    // Reply on its behalf with the vanilla core pack, which is all a client reports by default.
+    final List<KnownPacksPacket.KnownPack> clientPacks = List.of(new KnownPacksPacket.KnownPack(
+        "minecraft", "core",
+        serverConn.getPlayer().getProtocolVersion().getVersionIntroducedIn()));
+    serverConn.ensureConnected().write(new KnownPacksPacket(
+        packet.getPacks().stream().distinct().filter(clientPacks::contains).toList()));
     return true;
   }
 
@@ -252,7 +294,61 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   public boolean handle(FinishedUpdatePacket packet) {
     final MinecraftConnection smc = serverConn.ensureConnected();
     final ConnectedPlayer player = serverConn.getPlayer();
-    final ClientConfigSessionHandler configHandler = (ClientConfigSessionHandler) player.getConnection().getActiveSessionHandler();
+    final ClientConfigSessionHandler configHandler =
+        player.getConnection().getActiveSessionHandler() instanceof ClientConfigSessionHandler handler
+            ? handler : null;
+
+    // Read before recording, to tell "this server changed" from "this proxy had never seen it".
+    final String knownFingerprint = serverConn.getServer().getRegistryFingerprint();
+    final String sentRegistries = rememberRegistries(serverConn.getServer(), player);
+    if (configHandler == null && !sentRegistries.equals(player.getClientRegistryFingerprint())) {
+      switchAgainThroughConfiguration(player);
+      return true;
+    }
+
+    if (configHandler == null && tagsSentInPlay) {
+      // The client stayed in play and took this server's tags, so what it holds is no longer the
+      // previous server's. Only the tags can have changed: the registries had to match already.
+      player.setClientRegistryHashes(registryFingerprint.perRegistry());
+    }
+
+    if (configHandler == null) {
+      // The client never left play, so there is no client-side configuration to finish and no
+      // acknowledgement to wait for. The client also cannot resend its brand, so replay the one we
+      // recorded when it first joined, then advance the backend on its own.
+      final String clientBrand = player.getClientBrand();
+      if (clientBrand != null) {
+        final ByteBuf brandBuf = Unpooled.buffer();
+        ProtocolUtils.writeString(brandBuf, clientBrand);
+        smc.write(new PluginMessagePacket("minecraft:brand", brandBuf));
+      }
+
+      // A tick later, so the brand message is written before the state flips under it.
+      smc.eventLoop().execute(() -> {
+        advanceBackendToPlay(false);
+        smc.removePlayPacketQueueInboundHandler();
+
+        if (player.resourcePackHandler().getFirstAppliedPack() == null && resourcePackToApply != null) {
+          player.resourcePackHandler().queueResourcePack(resourcePackToApply);
+        }
+      });
+      return true;
+    }
+
+    // The client went through configuration, so it now holds what this server sent. Naming what
+    // changed says which registries two backends have to agree on to switch without one.
+    final Map<String, String> sentPerRegistry = registryFingerprint.perRegistry();
+    final List<String> differing =
+        RegistryFingerprint.differences(sentPerRegistry, player.getClientRegistryHashes());
+    if (knownFingerprint != null && !player.getClientRegistryHashes().isEmpty()
+        && !differing.isEmpty()) {
+      // Only when this proxy had already seen the destination configure: otherwise the client was
+      // reconfigured because nothing was known about it yet, and naming registries would mislead.
+      LOGGER.info("{} had to be reconfigured for {}: {} differ from the server it came from",
+          player.getUsername(), serverConn.getServerInfo().getName(), String.join(", ", differing));
+    }
+    player.setClientRegistryFingerprint(sentRegistries);
+    player.setClientRegistryHashes(sentPerRegistry);
 
     // Start client-side configuration; may hold the player to apply a resource pack.
     // The backend stays in CONFIG until it reads our acknowledgement (see advanceBackendToPlay).
@@ -344,6 +440,11 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(RegistrySyncPacket packet) {
+    registryFingerprint.add(packet);
+    if (clientStayedInPlay()) {
+      return true;
+    }
+
     serverConn.getPlayer().getConnection().write(packet.retain());
     return true;
   }
@@ -413,6 +514,63 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
   }
 
   /**
+   * Returns whether the client was left in the play state for this switch, which is what
+   * {@code remove-reconfig} does. When it was, anything that only makes sense to a client in the
+   * configuration state has to be answered here instead of relayed.
+   *
+   * @return {@code true} if the client never entered the configuration state
+   */
+  private boolean clientStayedInPlay() {
+    return !(serverConn.getPlayer().getConnection().getActiveSessionHandler()
+        instanceof ClientConfigSessionHandler);
+  }
+
+  /**
+   * Records the registries and tags this server just sent, so the next switch here can tell
+   * whether the client would need them.
+   *
+   * @param target the server whose configuration phase is finishing
+   * @param player the player it is finishing for, whose version decides whether tags count
+   * @return the fingerprint of what it sent
+   */
+  private String rememberRegistries(VelocityRegisteredServer target, ConnectedPlayer player) {
+    final String sent = registryFingerprint.finish(player.getProtocolVersion());
+    final String previous = target.getRegistryFingerprint();
+    if (!sent.equals(previous)) {
+      target.setRegistryFingerprint(sent);
+      // One line per change: backends printing the same hash share registries, so switches
+      // between them can leave the client in play.
+      LOGGER.info("{} sends registries {}{}", target.getServerInfo().getName(), sent.substring(0, 12),
+          previous == null ? "" : " (was " + previous.substring(0, 12) + ")");
+    }
+    return sent;
+  }
+
+  /**
+   * Abandons a switch that left the client in play, because this server turned out to send
+   * registries or tags the client does not hold -- it restarted with another datapack since it was
+   * last seen, say -- and connects again. The fingerprint just recorded sends the retry through the
+   * configuration state. Nothing from this server that depends on its registries has reached the
+   * client yet, and the client is still on its previous server, so all it notices is a slower
+   * switch.
+   *
+   * @param player the switching player
+   */
+  private void switchAgainThroughConfiguration(ConnectedPlayer player) {
+    LOGGER.warn("{} sends registries that {} does not hold ({}); switching again through "
+            + "configuration", serverConn.getServerInfo().getName(), player.getUsername(),
+        String.join(", ", RegistryFingerprint.differences(
+            registryFingerprint.perRegistry(), player.getClientRegistryHashes())));
+    serverConn.disconnect();
+    // Cancelled rather than failed: there is nothing to tell the player, the retry takes over.
+    resultFuture.complete(ConnectionRequestResults.plainResult(
+        ConnectionRequestBuilder.Status.CONNECTION_CANCELLED, serverConn.getServer()));
+    // Queued behind the in-flight reset that completing the result schedules on this same loop.
+    player.getConnection().eventLoop().execute(
+        () -> player.createConnectionRequest(serverConn.getServer()).fireAndForget());
+  }
+
+  /**
    * Acknowledges the backend and advances it to PLAY, decoupled from the client. Runs at most once.
    *
    * @param buffer whether to buffer the backend's inbound PLAY packets until the client enters PLAY
@@ -476,6 +634,12 @@ public class ConfigSessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    if (clientStayedInPlay()) {
+      // A configuration packet the proxy cannot decode would be read by a client in play as
+      // whatever play packet shares its ID.
+      return;
+    }
+
     serverConn.getPlayer().getConnection().write(buf.retain());
   }
 

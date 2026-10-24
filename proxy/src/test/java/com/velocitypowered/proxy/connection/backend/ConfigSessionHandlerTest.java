@@ -21,7 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -30,6 +32,8 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
+import com.velocitypowered.proxy.connection.client.ClientConfigSessionHandler;
+import com.velocitypowered.proxy.connection.client.ClientPlaySessionHandler;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
 import com.velocitypowered.proxy.connection.registry.DimensionInfo;
 import com.velocitypowered.proxy.network.Connections;
@@ -143,12 +147,8 @@ class ConfigSessionHandlerTest {
   @Test
   void configurationPacketsUnknownToTheProxyStillReachThePlayer() {
     MinecraftConnection playerConnection = mock(MinecraftConnection.class);
-    ConnectedPlayer player = mock(ConnectedPlayer.class);
-    when(player.getConnection()).thenReturn(playerConnection);
-    VelocityServerConnection serverConn = mock(VelocityServerConnection.class);
-    when(serverConn.getPlayer()).thenReturn(player);
-    ConfigSessionHandler handler = new ConfigSessionHandler(mock(VelocityServer.class), serverConn,
-        new CompletableFuture<>());
+    when(playerConnection.getActiveSessionHandler()).thenReturn(mock(ClientConfigSessionHandler.class));
+    ConfigSessionHandler handler = handlerFor(playerConnection);
     ByteBuf resetChat = Unpooled.buffer().writeByte(0x06);
 
     handler.handleUnknown(resetChat);
@@ -156,6 +156,28 @@ class ConfigSessionHandlerTest {
     verify(playerConnection).write(resetChat);
     assertEquals(2, resetChat.refCnt(), "retained for the write");
     resetChat.release(resetChat.refCnt());
+  }
+
+  @Test
+  void configurationPacketsUnknownToTheProxyAreDroppedWhileTheClientStaysInPlay() {
+    MinecraftConnection playerConnection = mock(MinecraftConnection.class);
+    when(playerConnection.getActiveSessionHandler()).thenReturn(mock(ClientPlaySessionHandler.class));
+    ConfigSessionHandler handler = handlerFor(playerConnection);
+    ByteBuf resetChat = Unpooled.buffer().writeByte(0x06);
+
+    handler.handleUnknown(resetChat);
+
+    verify(playerConnection, never()).write(any());
+    assertEquals(1, resetChat.refCnt(), "left for the caller to release");
+    resetChat.release();
+  }
+
+  private static ConfigSessionHandler handlerFor(MinecraftConnection playerConnection) {
+    ConnectedPlayer player = mock(ConnectedPlayer.class);
+    when(player.getConnection()).thenReturn(playerConnection);
+    VelocityServerConnection serverConn = mock(VelocityServerConnection.class);
+    when(serverConn.getPlayer()).thenReturn(player);
+    return new ConfigSessionHandler(mock(VelocityServer.class), serverConn, new CompletableFuture<>());
   }
 
   private static int configPacketId(MinecraftPacket packet) {
