@@ -18,6 +18,7 @@
 package com.velocitypowered.proxy.connection.backend;
 
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.connection.PlayPacketIds;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.packet.config.TagsUpdatePacket;
 import io.netty.buffer.ByteBuf;
@@ -38,10 +39,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  */
 final class TagsInPlay {
 
-  // ponytail: 26.1-26.2, the one protocol this network lets in. On any other version the tags are
-  // dropped as before, and RegistryFingerprint then demands they match for a client to stay in play.
-  private static final int PACKET_ID_26_1 = 0x86;
-
   private TagsInPlay() {
   }
 
@@ -53,8 +50,9 @@ final class TagsInPlay {
    * @return {@code true} if tags can be sent in play
    */
   static boolean canSend(ProtocolVersion version) {
-    return version.noLessThan(ProtocolVersion.MINECRAFT_26_1)
-        && version.noGreaterThan(ProtocolVersion.MINECRAFT_26_2);
+    // On a version without known IDs the tags are dropped, and RegistryFingerprint then demands
+    // they match for a client to stay in play.
+    return PlayPacketIds.of(version) != null;
   }
 
   /**
@@ -67,12 +65,13 @@ final class TagsInPlay {
    */
   static @Nullable ByteBuf encode(TagsUpdatePacket packet, ProtocolVersion version,
                                   ByteBufAllocator alloc) {
-    if (!canSend(version)) {
+    final PlayPacketIds ids = PlayPacketIds.of(version);
+    if (ids == null) {
       return null;
     }
     final ByteBuf inPlay = alloc.buffer();
     try {
-      ProtocolUtils.writeVarInt(inPlay, PACKET_ID_26_1);
+      ProtocolUtils.writeVarInt(inPlay, ids.tags());
       packet.encode(inPlay, ProtocolUtils.Direction.CLIENTBOUND, version);
       return inPlay;
     } catch (RuntimeException failed) {

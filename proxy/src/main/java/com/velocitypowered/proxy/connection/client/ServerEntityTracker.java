@@ -18,6 +18,7 @@
 package com.velocitypowered.proxy.connection.client;
 
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.connection.PlayPacketIds;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -40,11 +41,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  */
 final class ServerEntityTracker {
 
-  // ponytail: 26.1-26.2, as in ServerScoreboardTracker. On another version nothing is tracked and
-  // nothing is removed, which is where this started.
-  private static final int SPAWN_ENTITY_PACKET_ID = 0x01;
-  private static final int REMOVE_ENTITIES_PACKET_ID = 0x4D;
-
   private final IntSet spawned = new IntOpenHashSet();
 
   /**
@@ -55,12 +51,13 @@ final class ServerEntityTracker {
    * @param version  the client's protocol version
    */
   void observe(int packetId, ByteBuf packet, ProtocolVersion version) {
-    if (!isTracked(version)) {
+    final PlayPacketIds ids = PlayPacketIds.of(version);
+    if (ids == null) {
       return;
     }
-    if (packetId == SPAWN_ENTITY_PACKET_ID) {
+    if (packetId == ids.spawnEntity()) {
       spawned.add(ProtocolUtils.readVarInt(packet));
-    } else if (packetId == REMOVE_ENTITIES_PACKET_ID) {
+    } else if (packetId == ids.removeEntities()) {
       final int count = ProtocolUtils.readVarInt(packet);
       for (int i = 0; i < count; i++) {
         spawned.remove(ProtocolUtils.readVarInt(packet));
@@ -76,15 +73,16 @@ final class ServerEntityTracker {
    * @return the removal packet, or {@code null} when there is nothing to remove
    */
   @Nullable ByteBuf drainRemovals(ByteBufAllocator alloc, ProtocolVersion version) {
-    if (spawned.isEmpty() || !isTracked(version)) {
+    final PlayPacketIds ids = PlayPacketIds.of(version);
+    if (spawned.isEmpty() || ids == null) {
       spawned.clear();
       return null;
     }
     final ByteBuf removal = alloc.buffer();
-    ProtocolUtils.writeVarInt(removal, REMOVE_ENTITIES_PACKET_ID);
+    ProtocolUtils.writeVarInt(removal, ids.removeEntities());
     ProtocolUtils.writeVarInt(removal, spawned.size());
-    for (IntIterator ids = spawned.iterator(); ids.hasNext(); ) {
-      ProtocolUtils.writeVarInt(removal, ids.nextInt());
+    for (IntIterator entityIds = spawned.iterator(); entityIds.hasNext(); ) {
+      ProtocolUtils.writeVarInt(removal, entityIds.nextInt());
     }
     spawned.clear();
     return removal;
@@ -95,10 +93,5 @@ final class ServerEntityTracker {
    */
   void clear() {
     spawned.clear();
-  }
-
-  private static boolean isTracked(ProtocolVersion version) {
-    return version.noLessThan(ProtocolVersion.MINECRAFT_26_1)
-        && version.noGreaterThan(ProtocolVersion.MINECRAFT_26_2);
   }
 }

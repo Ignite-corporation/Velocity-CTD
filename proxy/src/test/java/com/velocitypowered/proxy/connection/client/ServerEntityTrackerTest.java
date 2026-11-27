@@ -62,8 +62,29 @@ class ServerEntityTrackerTest {
   void tracksNothingOnProtocolsWhoseIdsItDoesNotKnow() {
     final ServerEntityTracker tracker = new ServerEntityTracker();
     tracker.observe(SPAWN, varint(5), ProtocolVersion.MINECRAFT_1_21_11);
-    tracker.observe(SPAWN, varint(5), ProtocolVersion.MINECRAFT_26_3);
-    assertNull(tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT, ProtocolVersion.MINECRAFT_26_3));
+    assertNull(tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT,
+        ProtocolVersion.MINECRAFT_1_21_11));
+  }
+
+  @Test
+  void tracksEachProtocolByItsOwnIds() {
+    // 26.3 moved the removal one ID up; 0x4D is another packet there.
+    final ProtocolVersion v263 = ProtocolVersion.MINECRAFT_26_3;
+    final ServerEntityTracker tracker = new ServerEntityTracker();
+    tracker.observe(SPAWN, varint(5), v263);
+    tracker.observe(SPAWN, varint(9), v263);
+    final ByteBuf oldRemoval = varint(1);
+    ProtocolUtils.writeVarInt(oldRemoval, 5);
+    tracker.observe(REMOVE, oldRemoval, v263);
+    final ByteBuf removal = varint(1);
+    ProtocolUtils.writeVarInt(removal, 9);
+    tracker.observe(0x4E, removal, v263);
+
+    final ByteBuf drained = tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT, v263);
+    assertEquals(0x4E, ProtocolUtils.readVarInt(drained));
+    assertEquals(1, ProtocolUtils.readVarInt(drained));
+    assertEquals(5, ProtocolUtils.readVarInt(drained));
+    drained.release();
   }
 
   private static void spawn(ServerEntityTracker tracker, int entityId) {

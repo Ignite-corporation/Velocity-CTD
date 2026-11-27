@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.connection.PlayPacketIds;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import io.netty.buffer.ByteBuf;
@@ -86,22 +87,44 @@ class ServerScoreboardTrackerTest {
   void theProxyForwardsThesePacketsUndecoded() {
     // The tracker only sees what reaches handleUnknown; a packet class registered on these IDs
     // would take them away from it without anything failing.
-    for (ProtocolVersion version : List.of(ProtocolVersion.MINECRAFT_26_1, V26_2)) {
+    for (ProtocolVersion version : List.of(ProtocolVersion.MINECRAFT_26_1, V26_2,
+        ProtocolVersion.MINECRAFT_26_3)) {
+      final PlayPacketIds ids = PlayPacketIds.of(version);
       final StateRegistry.PacketRegistry.ProtocolRegistry registry =
           StateRegistry.PLAY.getProtocolRegistry(ProtocolUtils.Direction.CLIENTBOUND, version);
-      assertNull(registry.createPacket(OBJECTIVE), "objective packet decoded on " + version);
-      assertNull(registry.createPacket(TEAM), "team packet decoded on " + version);
-      assertNull(registry.createPacket(0x01), "spawn entity packet decoded on " + version);
-      assertNull(registry.createPacket(0x4D), "remove entities packet decoded on " + version);
+      assertNull(registry.createPacket(ids.objective()), "objective packet decoded on " + version);
+      assertNull(registry.createPacket(ids.team()), "team packet decoded on " + version);
+      assertNull(registry.createPacket(ids.spawnEntity()), "spawn entity packet decoded on " + version);
+      assertNull(registry.createPacket(ids.removeEntities()),
+          "remove entities packet decoded on " + version);
+      assertNull(registry.createPacket(ids.tags()), "tags packet decoded on " + version);
     }
+  }
+
+  @Test
+  void tracksEachProtocolByItsOwnIds() {
+    // 26.3 moved both packets two IDs up; 0x6C and 0x6F are other packets on 26.2.
+    final ProtocolVersion v263 = ProtocolVersion.MINECRAFT_26_3;
+    final ServerScoreboardTracker tracker = new ServerScoreboardTracker();
+    tracker.observe(OBJECTIVE, payload("old-id", 0), v263);
+    tracker.observe(0x6C, payload("sidebar", 0), v263);
+    tracker.observe(0x6F, payload("nametag", 0), v263);
+
+    final Set<String> removed = new HashSet<>();
+    for (ByteBuf removal : tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT, v263)) {
+      removed.add(Integer.toHexString(ProtocolUtils.readVarInt(removal)) + " "
+          + ProtocolUtils.readString(removal) + " " + removal.readByte());
+      removal.release();
+    }
+    assertEquals(Set.of("6c sidebar 1", "6f nametag 1"), removed);
   }
 
   @Test
   void tracksNothingOnProtocolsWhoseIdsItDoesNotKnow() {
     final ServerScoreboardTracker tracker = new ServerScoreboardTracker();
     tracker.observe(OBJECTIVE, payload("sidebar", 0), ProtocolVersion.MINECRAFT_1_21_11);
-    tracker.observe(OBJECTIVE, payload("sidebar", 0), ProtocolVersion.MINECRAFT_26_3);
-    assertTrue(tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT, ProtocolVersion.MINECRAFT_26_3).isEmpty());
+    assertTrue(tracker.drainRemovals(UnpooledByteBufAllocator.DEFAULT,
+        ProtocolVersion.MINECRAFT_1_21_11).isEmpty());
   }
 
   /** Feeds a packet the way ClientPlaySessionHandler does: ID first, then rewind for the next. */

@@ -18,6 +18,7 @@
 package com.velocitypowered.proxy.connection.client;
 
 import com.velocitypowered.api.network.ProtocolVersion;
+import com.velocitypowered.proxy.connection.PlayPacketIds;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -42,12 +43,6 @@ import java.util.Set;
  */
 final class ServerScoreboardTracker {
 
-  // ponytail: IDs for 26.1-26.2 only, the one protocol this network lets in. Any other version
-  // tracks nothing, which is the same behaviour as without this class. Add a range per protocol
-  // when the network upgrades (26.3 shifted the IDs of the packets around these).
-  private static final int OBJECTIVE_PACKET_ID = 0x6A;
-  private static final int TEAM_PACKET_ID = 0x6D;
-
   // Shared by both packets: 0 creates, 1 removes; the other methods update what already exists.
   private static final byte METHOD_ADD = 0;
   private static final byte METHOD_REMOVE = 1;
@@ -63,13 +58,13 @@ final class ServerScoreboardTracker {
    * @param version  the client's protocol version
    */
   void observe(int packetId, ByteBuf packet, ProtocolVersion version) {
-    if (!isTracked(version)
-        || (packetId != OBJECTIVE_PACKET_ID && packetId != TEAM_PACKET_ID)) {
+    final PlayPacketIds ids = PlayPacketIds.of(version);
+    if (ids == null || (packetId != ids.objective() && packetId != ids.team())) {
       return;
     }
     final String name = ProtocolUtils.readString(packet);
     final byte method = packet.readByte();
-    final Set<String> names = packetId == OBJECTIVE_PACKET_ID ? objectives : teams;
+    final Set<String> names = packetId == ids.objective() ? objectives : teams;
     if (method == METHOD_ADD) {
       names.add(name);
     } else if (method == METHOD_REMOVE) {
@@ -86,12 +81,13 @@ final class ServerScoreboardTracker {
    */
   List<ByteBuf> drainRemovals(ByteBufAllocator alloc, ProtocolVersion version) {
     final List<ByteBuf> removals = new ArrayList<>(objectives.size() + teams.size());
-    if (isTracked(version)) {
+    final PlayPacketIds ids = PlayPacketIds.of(version);
+    if (ids != null) {
       for (String name : objectives) {
-        removals.add(removal(alloc, OBJECTIVE_PACKET_ID, name));
+        removals.add(removal(alloc, ids.objective(), name));
       }
       for (String name : teams) {
-        removals.add(removal(alloc, TEAM_PACKET_ID, name));
+        removals.add(removal(alloc, ids.team(), name));
       }
     }
     objectives.clear();
@@ -113,10 +109,5 @@ final class ServerScoreboardTracker {
     ProtocolUtils.writeString(packet, name);
     packet.writeByte(METHOD_REMOVE);
     return packet;
-  }
-
-  private static boolean isTracked(ProtocolVersion version) {
-    return version.noLessThan(ProtocolVersion.MINECRAFT_26_1)
-        && version.noGreaterThan(ProtocolVersion.MINECRAFT_26_2);
   }
 }
